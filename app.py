@@ -275,11 +275,24 @@ class SSHMonitor(paramiko.ServerInterface):
     def _save_attempts(self) -> None:
         """Save SSH attempt logs to CSV"""
         try:
-            # Get all field names from attempts
-            fieldnames = ['timestamp', 'ip', 'password', 'city']
+            # Keep backward compatible column names while adding richer auth info
+            fieldnames = [
+                'timestamp',
+                'ip',
+                'password',
+                'city',
+                'username',
+                'auth_method',
+                'credential'
+            ]
             
             with open(self.ssh_log_file, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=fieldnames,
+                    restval='',
+                    extrasaction='ignore'
+                )
                 writer.writeheader()
                 for attempt in self.attempts:
                     writer.writerow(attempt)
@@ -349,10 +362,8 @@ class SSHMonitor(paramiko.ServerInterface):
             print(f"Error getting location data for IP {ip}: {e}")
             return None
 
-    def check_auth_password(self, username: str, password: str) -> int:
-        """Record the authentication attempt and reject"""
-        time.sleep(4)
-        
+    def _record_attempt(self, username: str, auth_method: str, credential: str) -> int:
+        """Record any authentication attempt and reject it"""
         location_data = self._get_location_data(self.client_ip)
         if location_data is None:
             return paramiko.AUTH_FAILED
@@ -360,19 +371,37 @@ class SSHMonitor(paramiko.ServerInterface):
         attempt = {
             "timestamp": datetime.datetime.now().isoformat(),
             "ip": self.client_ip,
-            "password": password,
-            "city": location_data["city"]
+            "password": credential if auth_method == 'password' else '',
+            "city": location_data["city"],
+            "username": username,
+            "auth_method": auth_method,
+            "credential": credential
         }
-        
+
         self.attempts.append(attempt)
         self._save_attempts()
-        
-        print(f"Knocking - IP: {self.client_ip}, City: {location_data['city']}")
+
+        print(
+            f"Knocking - IP: {self.client_ip}, City: {location_data['city']}, "
+            f"Auth: {auth_method}"
+        )
         return paramiko.AUTH_FAILED
 
+    def check_auth_password(self, username: str, password: str) -> int:
+        """Record password authentication attempts"""
+        time.sleep(4)
+        return self._record_attempt(username, 'password', password)
+
+    def check_auth_publickey(self, username: str, key: paramiko.PKey) -> int:
+        """Record public key authentication attempts"""
+        fingerprint = key.get_fingerprint()
+        fingerprint_hex = fingerprint.hex() if hasattr(fingerprint, 'hex') else str(fingerprint)
+        credential = f"{key.get_name()} {fingerprint_hex}"
+        return self._record_attempt(username, 'publickey', credential)
+
     def get_allowed_auths(self, username: str) -> str:
-        """Allow password authentication"""
-        return 'password'
+        """Allow password and public key authentication methods for logging"""
+        return 'password,publickey'
 
     def _handle_connection(self, client_socket: socket.socket, address: tuple) -> None:
         """Process a single connection"""
